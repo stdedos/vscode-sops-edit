@@ -4,14 +4,15 @@ import { EditorContext } from './EditorContext';
 import { FilePool } from "./FilePool";
 import { parse as yamlParse, parseAllDocuments as yamlParseAllDocuments } from "yaml";
 import {parse as iniParse} from 'ini';
-import { exec } from "node:child_process";
+import { exec, spawn } from "node:child_process";
 import * as c from "./constants";
+import { shlexSplit } from "./shlex";
 
 type PatternSet = [string, string[]];
 type PathDetails = {
-	fileName:string, 
-	parent:Uri, 
-	filePureName:string, 
+	fileName:string,
+	parent:Uri,
+	filePureName:string,
 	extension:string
 };
 type ProgressBar = Progress<{
@@ -84,25 +85,41 @@ function _executeShellCommand(command:string, cwd:Uri, errorMessage:string) : An
 
 async function _executeShellCommandWithProgressBar(command:string, cwd:Uri, progressTitle:string, errorMessage:string) : Promise<Answer> {
 	// run a shell command and show a moving progress bar in the mean time
-	let out:Answer = {stdout:'', stderr:''};
+	const out:Answer = {stdout:'', stderr:''};
+
+	// `command` is given as a string; let's split it
+    const [cmd, ...args] = shlexSplit(command);
+
 	await window.withProgress(
-		{location: ProgressLocation.Notification, cancellable: false, title: progressTitle}, 
+		{location: ProgressLocation.Notification, cancellable: false, title: progressTitle},
 		async (progress) => {
 			// create progress bar at 0%
 			progress.report({  increment: 0 });
-			// pointer with 'done' status which will be updated by the command once finished, 
-			// and monitored by the progress bar to close once updated 
+			// pointer with 'done' status which will be updated by the command once finished,
+			// and monitored by the progress bar to close once updated
 			const progressDetails = { isDone: false };
-			// execute shell command 
-			exec(command, {cwd: cwd.fsPath}, (_, stdout, stderr) => {
-				// once finished: update 'done' status, close progress bar
-				out = {stdout:stdout, stderr:stderr};
-				progress.report({ increment: 100 });
-				progressDetails.isDone = true;
-				return;
-			});
+
+			// execute command
+            await new Promise<void>((resolve) => {
+                const child = spawn(cmd, args, { cwd: cwd.fsPath });
+
+                const chunks: Buffer[] = [];
+                const errors: Buffer[] = [];
+
+                child.stdout?.on("data", (chunk: Buffer) => chunks.push(chunk));
+                child.stderr?.on("data", (chunk: Buffer) => errors.push(chunk));
+
+                child.on("close", () => {
+                    out.stdout = Buffer.concat(chunks).toString("utf8");
+                    out.stderr = Buffer.concat(errors).toString("utf8");
+                    progress.report({ increment: 100 });
+                    progressDetails.isDone = true;
+                    resolve();
+                });
+            });
+
 			// update progress bar while not done
-			await _fakeProgressUpdate(progress, progressDetails);			
+			await _fakeProgressUpdate(progress, progressDetails);
 		}
 	);
 	if (out.stderr) {
@@ -156,7 +173,7 @@ async function _decryptInPlace(encryptedFile:Uri) : Promise<Answer> {
 	return await _executeShellCommandWithProgressBar(decryptionCommand, enc.parent, progressTitle, errorMessage);
 }
 
-export async function decryptToTmpFile(encryptedFile:Uri, tempFile:Uri) : Promise<Answer> {
+export async function decryptToTmpFile(encryptedFile: Uri, tempFile: Uri): Promise<Answer> {
 	const enc = _dissectUri(encryptedFile);
 	const temp = _dissectUri(tempFile);
 	const decryptionCommand = c.decryptToTmpCommand.replace(c.fileString, enc.fileName).replace(c.tempFileString, temp.fileName);
@@ -167,7 +184,7 @@ export async function decryptToTmpFile(encryptedFile:Uri, tempFile:Uri) : Promis
 
 export function copyEncrypt(tempFile:Uri, originalFile:Uri) : Answer {
 	void copyFileSync(tempFile.fsPath, originalFile.fsPath);
-	return _encryptInPlace(originalFile);	
+	return _encryptInPlace(originalFile);
 }
 
 function _encryptInPlace(file:Uri) : Answer {
@@ -205,7 +222,7 @@ export async function getSopsFiles() : Promise<Uri[]> {
 }
 
 export async function isEncryptable(file:Uri) : Promise<boolean> {
-	// go through all regexes in all .sops.yaml files, combine them with 
+	// go through all regexes in all .sops.yaml files, combine them with
 	// the .sops.yaml file location, and return if given file path matches any
 	const sopsFiles =  await getSopsFiles();
 	for (const sf of sopsFiles) {
@@ -229,7 +246,7 @@ export function isEncrypted(file:Uri) : boolean {
 	} else if (extension === 'env') {
 		return isEncryptedEnvFile(contentString);
 	}
-		
+
 	return isEncryptedYamlFile(contentString);
 }
 
@@ -290,7 +307,7 @@ function _getSopsPatternsFromFile(sopsFile:Uri) : PatternSet {
 	const contentString: string = readFileSync(sopsFile.fsPath, 'utf-8');
 	// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
 	const content = yamlParse(contentString);
-	
+
 	// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-return, @typescript-eslint/no-explicit-any
 	const fileRegexes: string[] = content.creation_rules.map((cr:any) => cr.path_regex);
 	return [_getParentUri(sopsFile).path, fileRegexes];
